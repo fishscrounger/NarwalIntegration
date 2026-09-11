@@ -42,7 +42,7 @@ This integration uses a **local WebSocket connection on port 9002**. Only models
 | **Freo X10 Pro** (AX15) | **Working** | Community confirmed ([#12](https://github.com/sjmotew/NarwalIntegration/issues/12)) |
 | **Narwal JX** | **Working** | Confirmed by [@Smiorld](https://github.com/sjmotew/NarwalIntegration/issues/42) — port 9002 open, connects, map loads. Selectable in the model list; commands beyond connect/map not yet exercised ([#42](https://github.com/sjmotew/NarwalIntegration/issues/42)). Not the same platform as the Freo 20 — the two report different product keys |
 | **Narwal Freo 20** | **Working** | Confirmed by [@kvkessler](https://github.com/sjmotew/NarwalIntegration/issues/97) on firmware v01.00.35.03 via Other / Auto-detect — map streaming, current room, cleaning area and dock sensors all live. Product key `fjhpiem4ba`; selectable by name from the next release ([#97](https://github.com/sjmotew/NarwalIntegration/issues/97)) |
-| **Freo Z Ultra** (hardware CX7, cloud identity J5) | **Working on tested variant** | Confirmed with product key `hEA7OEshlx` on firmware `v01.13.11.02`. Requires the cloud-assigned Device ID because this model does not broadcast. Base status, maps, consumables, and commands work locally; live cleaning position/progress is unavailable. See the variant note below. |
+| **Freo Z Ultra** (hardware CX7, cloud identity J5) | **Working on tested variant** | Confirmed with product key `hEA7OEshlx` on firmware `v01.13.11.02`, on two independent robots (one EU). Requires the cloud-assigned Device ID because this model does not broadcast. Base status, maps, consumables, room-selective cleaning and work-mode selection all work locally; live cleaning position/progress is unavailable. Commands needed the capability gating relaxed — see *CX7 state is not a usable signal* below. |
 | **Freo Z10** (plain, non-Ultra / non-Pro) | **Under investigation** | Advertises `_narwal_sweeper._tcp` over mDNS and is picked up by discovery, but port 9002 returns `ECONNREFUSED` in every device state — the host is healthy and nothing is listening. Distinct from the Z10 Pro / Turbo and Z10 Ultra above, both of which work ([#92](https://github.com/sjmotew/NarwalIntegration/issues/92)) |
 | **Freo X Ultra** (AX18/AX19) | **Not Compatible** | Uses ZeroMQ (port 6789) + Tuya cloud, not WebSocket ([#4](https://github.com/sjmotew/NarwalIntegration/issues/4)) |
 | **Freo X Plus** | **Not Compatible** | Cloud-only — no local API |
@@ -76,6 +76,10 @@ Shipped in v1.0.2 ([#50](https://github.com/sjmotew/NarwalIntegration/pull/50)) 
 - Dust bag health and detergent remaining ([#52](https://github.com/sjmotew/NarwalIntegration/pull/52), v1.0.2)
 - Station and consumable binary sensors — clean water tank, sewage tank, dust box, dust bag, station bag, error ([#52](https://github.com/sjmotew/NarwalIntegration/pull/52), v1.0.2)
 - Maintenance and replacement alerts, with the affected parts listed as attributes ([#54](https://github.com/sjmotew/NarwalIntegration/pull/54), v1.0.2)
+- **Battery diagnostics** — health, charge cycles, voltage, current, temperature, and the true cell
+  charge alongside the level the app displays. Polled from `developer/get_robot_info` every 15
+  minutes; absent on models that do not answer that topic, and the entities simply stay
+  unavailable there
 
 ### Live Map
 - Color-coded floor plan with room labels (all rooms — user-named and auto-generated)
@@ -137,10 +141,19 @@ To add one by hand, or if discovery doesn't find it:
 <details>
 <summary>How discovery finds the robot</summary>
 
-The robot advertises `_narwal_sweeper._tcp.local.` over mDNS, as an instance named
-`_app_wss_server_<6hex>` with hostname `NARWAL_<6hex>.local.` on port 9002. Those six
-hex characters are the tail of the robot's device ID, which is how a discovery is
-matched to a robot you already added manually.
+The robot advertises `_narwal_sweeper._tcp.local.` over mDNS on port 9002. Those six
+hex characters in its name are the tail of the robot's device ID, which is how a
+discovery is matched to a robot you already added manually.
+
+The name's shape varies by model, so the **hostname** is what discovery reads:
+
+| Model | Instance | Hostname |
+|---|---|---|
+| Flow (AX12) | `_app_wss_server_<6hex>` | `NARWAL_<6hex>.local.` |
+| Freo Z Ultra (CX7) | `_app_ws_server` (no suffix) | `NARWAL_<6hex>-<3digits>.local.` |
+
+On the CX7 the instance name carries no device-ID tail at all, so anything matching on
+the instance rather than the hostname will not find it.
 
 Some networks drop multicast between VLANs or under wireless client isolation, and
 mDNS then never arrives. DHCP hostname matching covers that case — Home Assistant
@@ -207,10 +220,26 @@ identifier used as the second component of a Narwal MQTT topic:
 
 You can obtain it from one of these sources:
 
-- The `deviceId` field returned by Narwal's authenticated account endpoint
-  `/user-device-platform-server/device-info/getDeviceInfoList`.
-- A Narwal MQTT capture, where it appears in the topic position shown above.
+- **A Narwal MQTT capture**, where it appears in the topic position shown above. This is the
+  reliable route: the app's MQTT client does not verify the broker's certificate, so a relay
+  with a self-signed certificate can read the topics. Point the broker hostname
+  (`<region>-mqtt.narwaltech.com`, e.g. `eu-mqtt`) at a machine on your LAN, relay port 8883
+  to the real broker, and reopen the app — the first frames carry
+  `/<product_key>/<device_id>/...`. Note the app keeps a long-lived MQTT connection, so the
+  app must be **force-stopped** for it to re-resolve the hostname.
 - The stored device identifier or diagnostics from an existing Narwal cloud integration.
+
+> **The account API cannot give you this value.** Earlier revisions of this document pointed at
+> `/user-device-platform-server/device-info/getDeviceInfoList`; that endpoint returns 404 on
+> every Narwal host (`eu-app`, `us-app`, `il-app`, `cn-app`, `app`, `usaclient`, `universal`).
+> The API has no endpoint that enumerates your devices at all — every per-device route requires
+> the `device_id` you are trying to find, and answers `err_code 101502`
+> ("has no privilege of device") without it. Login itself is unsigned email + password against
+> `/user-authentication-server/v2/login/loginByEmail`, and the auth header is `Auth-Token`;
+> anything else returns `err_code 130105`.
+
+A cross-check once you have it: the six hex characters in the robot's mDNS hostname are the
+**tail of the device ID**, so `NARWAL_c07174-….local.` confirms an ID ending `c07174`.
 
 Account and MQTT tooling is deliberately kept separate from this integration so Home Assistant
 never receives your Narwal credentials. Do not post the Device ID publicly; treat it as a device
@@ -345,7 +374,8 @@ Notes:
 
 - **Wake from deep sleep is unreliable** — robot may not respond after long idle periods. Opening the Narwal app briefly can help.
 - **Single connection** — close the Narwal app before using HA to avoid conflicts.
-- **CX7 has no live stream** — it never broadcasts, so cleaning position and progress do not update live. Polled base status, battery, dock state, maps, consumables, and commands remain available. State follows the 60-second poll, so the vacuum entity reaches `cleaning` up to a minute after the robot starts (31 s in a recorded run), and `cleaning_time`, `cleaning_area` and `current_room` stay `unknown` throughout a clean because they are only carried in broadcasts.
+- **CX7 has no live stream** — it never broadcasts, so cleaning position and progress do not update live. Polled base status, battery, dock state, maps, consumables, and commands remain available. `cleaning_time`, `cleaning_area` and `current_room` stay `unknown` throughout a clean because they are only carried in broadcasts. Requesting the broadcast-only topics directly does not substitute: `status/working_status`, `map/display_map`, `status/point_navi_plan_traj`, `info/get_clean_progress_info`, `robot/status/get`, `robot/task/status/get` and `info/battery_info` were all silent on a CX7, both idle and mid-clean.
+- **CX7 state is not a usable signal** — its `base_status` field 3 is `{1: 19, 18: 1}`, and that did not change across 40 s while the robot physically drove back to its dock; it never reports CLEANING or RETURNING, and `is_docked` stays `true` while the robot is away. Every capability predicate therefore evaluates false while it sits there, which previously left the vacuum entity advertising `STATE` and no commands at all. Capability gating is now skipped for non-broadcasting models and the robot arbitrates instead, returning `NOT_APPLICABLE` / `CONFLICT` / `NOT_READY` when it declines. The reported state still lags, so the entity's displayed activity remains unreliable on this model — control works, telemetry does not.
 - **Fan speed is set-only** — robot doesn't broadcast its current level.
 - **All cleaning requires the dock** — `clean/start_clean` returns `NOT_READY` if the robot is not docked when the command is sent. This applies to whole-house `vacuum.start` as well as room cleans.
 - **Room cleaning needs a segment-to-area mapping** — `vacuum.clean_area` targets Home Assistant *areas*, not robot rooms, and the mapping editor is on the **entity**, not the integration or device page. See [Room cleaning setup](#room-cleaning-setup-required-before-vacuumclean_area-works). Without it the service fails with "Area mapping is not configured".

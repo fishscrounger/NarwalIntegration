@@ -34,6 +34,19 @@ start a clean, return it to the dock, reboot it, or read the floor plan of the h
 the robot's design, not this integration's. Treat port 9002 the way you'd treat any other
 unauthenticated LAN device and segment your network accordingly.
 
+**It will also hand out your Wi-Fi password.** `developer/get_robot_info` returns the network
+block as cleartext `ssid:<name>` / `psk:<pre-shared key>`, over that same unauthenticated
+socket. No pairing, no token — anything that can open a TCP connection to port 9002 can read
+the Wi-Fi credentials for the network it is sitting on. This raises the stakes on the
+segmentation advice above from good hygiene to something with a concrete consequence.
+
+It also constrains clients. This integration's diagnostics download already redacts the IP,
+device ID and account UUID, and users are asked to attach it to public GitHub issues — so any
+code that reads `developer/get_robot_info` **must** discard the PSK at parse time rather than
+relying on a redaction step downstream. The parser in `narwal_client/client.py` drops any
+label or value matching `psk` / `password` / `passwd` before the data reaches a
+`RobotDiagnostics`, and `tests/test_robot_diagnostics.py` pins that.
+
 **The robot accepts one connection per IP.** A second connection from the same address is
 refused with `connection with same ip, close old one`. In practice this means you must disable
 the Home Assistant config entry before running a diagnostic script from the same host.
@@ -315,7 +328,7 @@ Field names from the decompiled `BuilderInfo`; values live-validated where noted
 | 29 | Active mop humidity |
 | 35 | Station bag health %, float32 — *absent on AX12 v01.08.03.07* |
 | 36 | Station bag health reset time (Unix seconds) — **unverified** |
-| 38 | **Disputed** — `100` on every observation. Read as battery *design capacity* in one place and as curing-agent consumption % in another; see §11 |
+| 38 | `100` on every observation. **Not a battery-condition metric**: `developer/get_robot_info` reported health `89%` on a robot whose field 38 read `100` in the same session, so it cannot be tracking cell wear. Whether it is curing-agent consumption % remains open; see §11 |
 | 39 | Station bag state (enum) |
 | 41 | Detergent remaining % (`heavyDetergentRemainPercent`) — **unverified**, `100` on every observation; see §11 |
 | 47 | Charging status (enum) |
@@ -331,6 +344,20 @@ Field 3 sub-fields:
 | 3.7 | `1` = returning to dock |
 | 3.10 | Dock sub-state (1 = docked, 2 = docking) |
 | 3.12 | Dock activity (2, 6 observed) |
+| 3.18 | Purpose unknown; `1` on CX7, where it is one of only two sub-fields present |
+
+**On the CX7 this message is close to useless as a state signal.** Field 3 is exactly
+`{1: 19, 18: 1}` — none of 3.2, 3.7, 3.10 or 3.12 exist — and it did not change across 40 s
+of polling while the robot physically drove back to its dock. It reported
+`19` (TASK_COMPLETED) while driving and `2` (DOCKED_V2) moments after a clean was accepted,
+and `is_docked` read `true` throughout, including while the robot was away from the dock.
+
+It does eventually settle (the same robot later read `1` / STANDBY), so this is a lag rather
+than a frozen field — which is worse to diagnose, because capabilities derived from it appear
+and disappear. Clients should not gate commands on this message for non-broadcasting models;
+send the command and let the robot refuse. Everything the predicates were blocking —
+`clean/start_clean` with a room-and-mode CleanTask, `supply/recall`, `task/force_end` — was
+accepted by the robot with `SUCCESS` in the same state.
 
 **`WorkingStatus` values are empirical and deliberately do not match the app's compiled
 `TaskType` enum**, whose numbering the field nominally uses. Trust live observation here:
@@ -588,6 +615,31 @@ rest are known-to-exist and unexplored — good starting points for anyone probi
 Also observed but not in the table above: `/status/get_device_base_status` (C→R, full status
 dump on demand) and `/developer/get_robot_debug_image` (C→R, cleartext carpet/planning PNGs).
 
+### Answered locally, previously unexplored
+
+Probed read-only against a CX7 on fw `v01.13.11.02`. All returned data; none is used by the
+integration except `developer/get_robot_info`. Sizes are the raw response frame.
+
+| Topic | Size | Content |
+|---|---|---|
+| `/developer/get_robot_info` | ~830 B | Labelled sections: device/product id, network (**including the Wi-Fi PSK — see §1**), per-component firmware, and a battery block: level, real level, health %, charge cycles, charge-time-remaining, current, voltage, temperature |
+| `/common/upgrade/get_firmware_version` | ~350 B | Per-module firmware: robot mcu/ble/cpu, base-station mcu/ble/cpu, vision ai/cpu, plus sensor modules (`0220_SS_LD02`, `0220_SS_CH01`) |
+| `/config/get` | ~175 B | Settings block. Field 2.1 = `70` (volume-shaped), 2.4.2/2.4.3 = `79200`/`28800` — a 22:00→08:00 do-not-disturb window in seconds — 2.3 = timezone, plus ~8 unmapped flags |
+| `/region/get` | ~75 B | Timezone, UTC offset, country, city, and the robot's own wall clock |
+| `/config/language/get_current_voice_info` | ~35 B | Language code, voice-pack version and pack id |
+| `/info/get_clean_time_line` | ~330 B | Session timeline |
+| `/consumable/get_consumable_info` | 6 B | Empty payload when nothing needs attention — the §10 trap, and a useful fixture for it |
+
+### Silent on CX7
+
+Requested and never answered, idle and mid-clean. Worth recording so nobody re-probes them
+hoping to substitute for the missing broadcasts:
+
+`status/working_status` · `map/display_map` · `status/point_navi_plan_traj` ·
+`info/get_clean_progress_info` · `robot/status/get` · `robot/task/status/get` ·
+`info/battery_info` · `schedule/clean_schedule/get` · `config/key_mapping/get` ·
+`operate/conf/get` · `voice/get_voice_list` · all 27 `clean_system/*` topics
+
 ### Confirmed cloud-only
 
 These exist as topics but do not serve data locally:
@@ -690,9 +742,12 @@ passes); we expose one control.
 **Consumables — several, tracked together in
 [#79](https://github.com/sjmotew/NarwalIntegration/issues/79).**
 
-- *What is `base_status` field 38?* It reads `100` on every observation, and this project
-  describes it as battery design capacity in one place and curing-agent consumption % in
-  another. Both survive the data; one is wrong.
+- *What is `base_status` field 38?* **Half answered.** It reads `100` on every observation, and
+  this project described it as battery design capacity in one place and curing-agent
+  consumption % in another. The battery reading is now ruled out: `developer/get_robot_info`
+  reported health `89%` on a robot whose field 38 read `100` in the same session, so field 38
+  is not tracking cell condition. Whether it is the curing agent is still untested — that needs
+  a capture taken with a visibly depleted cartridge.
 - *Is field 41 really detergent remaining?* The name `heavyDetergentRemainPercent` comes from
   the decompiled app. It has only ever been observed as `100`, on a robot whose battery also
   reads `100`. A capture taken side by side with a visibly low cartridge settles it.
