@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,7 @@ from .const import (
     TOPIC_CMD_GET_DEVICE_INFO,
     TOPIC_CMD_GET_FEATURE_LIST,
     TOPIC_CMD_GET_MAP,
+    TOPIC_CMD_GET_ROBOT_INFO,
     TOPIC_CMD_NOTIFY_APP_EVENT,
     TOPIC_CMD_PAUSE,
     TOPIC_CMD_RECALL,
@@ -78,6 +80,7 @@ from .models import (
     MapData,
     MapDisplayData,
     NarwalState,
+    RobotDiagnostics,
 )
 from .protocol import (
     PROTOBUF_FIELD5_TAG,
@@ -141,7 +144,11 @@ def _robot_work_blocks_generic_dock_stop(state: NarwalState) -> bool:
 
 
 def _robot_start_blocked(state: NarwalState) -> bool:
-    """Return true unless fresh state permits dispatching a robot start."""
+    """Return true unless fresh state permits dispatching a robot start.
+
+    Only meaningful when the robot's state actually tracks what it is doing.
+    See NarwalClient._start_blocked for models where it does not.
+    """
     return (
         state.has_error
         or state.working_status in (WorkingStatus.UNKNOWN, WorkingStatus.ERROR)
@@ -149,6 +156,143 @@ def _robot_start_blocked(state: NarwalState) -> bool:
         or _clean_session_context(state)
         or state.blocks_robot_start_for_dock_task
     )
+
+
+# developer/get_robot_info labels. The robot emits these in Chinese whatever
+# the configured voice language is, so they are matched literally.
+_ROBOT_INFO_BATTERY_LABELS: dict[str, tuple[str, type]] = {
+    "电量": ("battery_level", int),
+    "真实电量": ("battery_real_level", int),
+    "健康值": ("battery_health", int),
+    "使用次数": ("battery_cycles", int),
+    "充电剩余时间": ("charge_remaining_minutes", int),
+    "电流": ("battery_current", float),
+    "电压": ("battery_voltage", float),
+    "温度": ("battery_temperature", float),
+}
+
+# Substrings whose values must never be retained. developer/get_robot_info
+# returns the Wi-Fi pre-shared key in clear, and this response feeds a Home
+# Assistant diagnostics download that users attach to public bug reports.
+_ROBOT_INFO_REDACT = ("psk", "password", "passwd")
+
+
+def _pb_fields(data: bytes) -> Iterator[tuple[int, int, Any]]:
+    """Yield (field_number, wire_type, value) for one protobuf message."""
+    i = 0
+    while i < len(data):
+        tag = data[i]
+        i += 1
+        field_num, wire_type = tag >> 3, tag & 0x07
+        if wire_type == 0:
+            value = 0
+            shift = 0
+            while i < len(data):
+                byte = data[i]
+                i += 1
+                value |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            yield field_num, wire_type, value
+        elif wire_type == 2:
+            length = 0
+            shift = 0
+            while i < len(data):
+                byte = data[i]
+                i += 1
+                length |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            yield field_num, wire_type, data[i : i + length]
+            i += length
+        elif wire_type == 5:
+            i += 4
+        elif wire_type == 1:
+            i += 8
+        else:
+            return
+
+
+def _readable(chunk: bytes) -> str | None:
+    """Return chunk as text when it is plausibly a string field."""
+    try:
+        text = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text or any(ord(ch) < 0x20 and ch not in "\t\n" for ch in text):
+        return None
+    return text.strip()
+
+
+def _collect_strings(chunk: bytes, depth: int = 0) -> list[str]:
+    """Harvest readable strings from a nested value, dropping secrets."""
+    if depth > 4:
+        return []
+    text = _readable(chunk)
+    if text is not None:
+        low = text.lower()
+        if any(marker in low for marker in _ROBOT_INFO_REDACT):
+            return []
+        return [text] if text else []
+    found: list[str] = []
+    for _num, wire_type, value in _pb_fields(chunk):
+        if wire_type == 2 and isinstance(value, bytes):
+            found.extend(_collect_strings(value, depth + 1))
+    return found
+
+
+def _parse_robot_info(raw: bytes) -> RobotDiagnostics | None:
+    """Parse developer/get_robot_info into RobotDiagnostics.
+
+    Shape: {1: result, 2: repeated Section{1: title, 2: repeated
+    Item{1: label, 2: value}}}. Values are usually strings ("100%", "519",
+    "16.039000") but nest further for the Wi-Fi and version blocks.
+    """
+    diagnostics = RobotDiagnostics()
+    found_any = False
+
+    for field_num, wire_type, value in _pb_fields(raw):
+        if field_num != 2 or wire_type != 2 or not isinstance(value, bytes):
+            continue
+        title = ""
+        items: dict[str, str] = {}
+        for sub_num, sub_wire, sub_value in _pb_fields(value):
+            if sub_wire != 2 or not isinstance(sub_value, bytes):
+                continue
+            if sub_num == 1:
+                title = _readable(sub_value) or ""
+                continue
+            if sub_num != 2:
+                continue
+            label = ""
+            parts: list[str] = []
+            for item_num, item_wire, item_value in _pb_fields(sub_value):
+                if item_wire != 2 or not isinstance(item_value, bytes):
+                    continue
+                if item_num == 1:
+                    label = _readable(item_value) or ""
+                elif item_num == 2:
+                    parts.extend(_collect_strings(item_value))
+            if not label:
+                continue
+            if any(marker in label.lower() for marker in _ROBOT_INFO_REDACT):
+                continue
+            items[label] = "; ".join(parts)
+            found_any = True
+
+            mapped = _ROBOT_INFO_BATTERY_LABELS.get(label)
+            if mapped and parts:
+                attr, caster = mapped
+                match = re.search(r"-?\d+(?:\.\d+)?", parts[0])
+                if match:
+                    with contextlib.suppress(ValueError):
+                        setattr(diagnostics, attr, caster(float(match.group())))
+        if title or items:
+            diagnostics.sections[title or f"section_{field_num}"] = items
+
+    return diagnostics if found_any else None
 
 
 def _can_force_end_scoped_dock_task(state: NarwalState, task: str | None) -> bool:
@@ -1211,7 +1355,7 @@ class NarwalClient:
         """
         if not self.connected:
             raise NarwalConnectionError("Not connected to vacuum")
-        if _robot_start_blocked(self.state):
+        if self._start_blocked():
             _LOGGER.warning(
                 "start: robot or dock task active (%s); not starting whole-house clean",
                 self.state.active_dock_task_keys or "unmapped",
@@ -1492,7 +1636,7 @@ class NarwalClient:
         if not room_ids:
             return CommandResponse(result_code=CommandResult.NOT_READY)
         async with self._robot_start_lock:
-            if _robot_start_blocked(self.state):
+            if self._start_blocked():
                 _LOGGER.warning(
                     "start_rooms: robot or dock guard active (%s); not starting room clean",
                     self.state.active_dock_task_keys or "private",
@@ -1528,7 +1672,7 @@ class NarwalClient:
             except ValueError as err:
                 _LOGGER.warning("start_rooms: %s", err)
                 return CommandResponse(result_code=CommandResult.NOT_APPLICABLE)
-            if _robot_start_blocked(self.state):
+            if self._start_blocked():
                 _LOGGER.warning(
                     "start_rooms: state changed before dispatch; not starting room clean"
                 )
@@ -1548,7 +1692,7 @@ class NarwalClient:
                     break
                 _LOGGER.info("start_rooms: robot docking/settling, retrying clean/start_clean")
                 await asyncio.sleep(3.0)
-                if _robot_start_blocked(self.state):
+                if self._start_blocked():
                     _LOGGER.warning(
                         "start_rooms: state changed before retry; not starting room clean"
                     )
@@ -1563,7 +1707,7 @@ class NarwalClient:
     async def start_easy_clean(self) -> CommandResponse:
         """Start quick/easy clean."""
         async with self._robot_start_lock:
-            if _robot_start_blocked(self.state):
+            if self._start_blocked():
                 _LOGGER.warning(
                     "start_easy_clean: robot or dock guard active (%s); not starting quick clean",
                     self.state.active_dock_task_keys or "private",
@@ -1710,6 +1854,28 @@ class NarwalClient:
                     self.state.clear_dock_drying_task(active_task)
             return response
 
+    def _start_blocked(self) -> bool:
+        """Return true when local state proves a start must not be dispatched.
+
+        The guard reads `is_docked`, `_clean_session_context` and friends, all
+        of which assume state that tracks the robot. Models which never
+        broadcast lag badly enough to break that assumption: a Freo Z Ultra
+        (CX7, `hEA7OEshlx`, fw v01.13.11.02) sat at `working_status` 19
+        (TASK_COMPLETED) with a field-3 subtree of `{1: 19, 18: 1}` that did
+        not change across 40s while the robot physically drove back to its
+        dock. While it sits there `_clean_session_context` is true and every
+        start is refused before a frame is ever sent. It does clear eventually,
+        so the refusal is intermittent rather than permanent.
+
+        The robot arbitrates correctly on its own. Sent directly to that CX7
+        while the guard claimed a clean session was live, `clean/start_clean`
+        for one room in vacuum-only mode returned SUCCESS and
+        `clean/current_clean_task/get` read the task back unchanged. So on
+        these models let the robot answer, and surface its CONFLICT /
+        NOT_APPLICABLE / NOT_READY if it declines.
+        """
+        return self.supports_broadcasts and _robot_start_blocked(self.state)
+
     async def return_to_base(self, timeout: float = COMMAND_RESPONSE_TIMEOUT) -> CommandResponse:
         """Return to charging dock."""
         return await self.send_command(TOPIC_CMD_RECALL, timeout=timeout)
@@ -1845,6 +2011,22 @@ class NarwalClient:
         """Query supported features. Returns {feature_id: value}."""
         resp = await self.send_command(TOPIC_CMD_GET_FEATURE_LIST)
         return {int(k): int(v) for k, v in resp.data.items()}
+
+    async def get_robot_info(self) -> RobotDiagnostics | None:
+        """Query developer/get_robot_info for battery and module engineering data.
+
+        Returns None when the robot does not answer; the topic is not present
+        on every model. The Wi-Fi PSK the robot includes is discarded during
+        parsing and never stored — see _parse_robot_info.
+        """
+        resp = await self.send_command(TOPIC_CMD_GET_ROBOT_INFO, timeout=10.0)
+        raw = getattr(resp, "raw_payload", None)
+        if not raw:
+            return None
+        diagnostics = _parse_robot_info(raw)
+        if diagnostics is not None:
+            self.state.diagnostics = diagnostics
+        return diagnostics
 
     async def get_status(self, full_update: bool = True) -> CommandResponse:
         """Query current device base status.
