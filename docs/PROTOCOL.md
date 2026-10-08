@@ -123,6 +123,30 @@ Because the topic is empty, responses are **not self-identifying**. You cannot t
 command a response belongs to from the frame itself. Serialize your commands, or you will
 mis-attribute results — this integration holds a lock across send-and-await for that reason.
 
+Serializing is not enough on its own. A response can arrive *after* its command has timed
+out (1.3 s late in #108), and the keepalive sends commands of its own that are answered too.
+The client therefore records every request that is owed a response, in send order, and hands
+each response to the oldest one still waiting. A timed-out command keeps its place for a
+further 10 s so its late answer is discarded rather than returned to the next caller.
+
+The robot also closes any socket **60 s after the last command it received** (close 1000
+`Idle timeout`; websocket pings do not count). `status/app_status_heartbeat` resets that timer, is
+never answered, and does not wake a docked robot, which is why the client sends it on every
+keepalive tick (#113; measured on the X10 Pro and the Flow).
+
+Not every command is answered. Measured on a Freo X10 Pro (`v01.03.10.03`, awake) and, with
+identical results, on a Flow (AX12, `v01.08.03.07`, docked and idle; latencies 3-5 ms):
+
+| Command | Responses | Latency |
+|---|---|---|
+| `status/app_status_heartbeat` | **none** | — |
+| `common/active_robot_publish` (either form) | 1 | 4–9 ms |
+| `common/notify_app_event` | 1 | 45 ms |
+| `status/get_device_base_status` | 1 | 5 ms |
+
+A five-command wake burst drew exactly four responses on both models. A heartbeat must not hold a place in
+the order, or it would swallow the next real answer.
+
 ---
 
 ## 3. Topics
@@ -344,6 +368,20 @@ Field 3 sub-fields:
 | 3.7 | `1` = returning to dock |
 | 3.10 | Dock sub-state (1 = docked, 2 = docking) |
 | 3.12 | Dock activity (2, 6 observed) |
+| 3.18 | Purpose unknown; `1` on CX7, where it is one of only two sub-fields present |
+
+**On the CX7 this message is close to useless as a state signal.** Field 3 is exactly
+`{1: 19, 18: 1}` — none of 3.2, 3.7, 3.10 or 3.12 exist — and it did not change across 40 s
+of polling while the robot physically drove back to its dock. It reported
+`19` (TASK_COMPLETED) while driving and `2` (DOCKED_V2) moments after a clean was accepted,
+and `is_docked` read `true` throughout, including while the robot was away from the dock.
+
+It does eventually settle (the same robot later read `1` / STANDBY), so this is a lag rather
+than a frozen field — which is worse to diagnose, because capabilities derived from it appear
+and disappear. Clients should not gate commands on this message for non-broadcasting models;
+send the command and let the robot refuse. Everything the predicates were blocking —
+`clean/start_clean` with a room-and-mode CleanTask, `supply/recall`, `task/force_end` —
+was accepted by the robot with `SUCCESS` in the same state.
 
 **`WorkingStatus` values are empirical and deliberately do not match the app's compiled
 `TaskType` enum**, whose numbering the field nominally uses. Trust live observation here:
